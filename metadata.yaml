@@ -1,0 +1,12 @@
+name: astrbot_plugin_bili_audio
+display_name: B站音频提取
+desc: "发送 /提取音频 + BV 号，机器人按 60 秒切片发送可点击的 QQ 语音消息；支持 /账号登录 扫码登录 B 站。"
+short_desc: "B站音频提取，支持扫码登录"
+version: v0.1.0
+author: Hitori2136
+repo: https://github.com/Hitori2136/astrbot_plugin_bili_audio
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
