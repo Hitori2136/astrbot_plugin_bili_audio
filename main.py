@@ -1,12 +1,13 @@
 """B 站音频提取插件。
 
 指令：
-    /提取音频 BV号   提取音频，按 60 秒切片发送 QQ 语音条
+    /提取音频 BV号   提取音频，默认整段发送一条 QQ 语音条
 
 设计约束（按 AstrBot 4.29.1 / 4.19.5 的公共接口编写）：
 - 只接受 B 站普通视频的 BV 号，插件会拼成
-  https://www.bilibili.com/video/BV号 后交给 yt-dlp；
-- 音频走 yt-dlp + ffmpeg 转 16kHz 单声道 WAV，再用标准库 wave 切片；
+  https://www.bilibili.com/video/BV号；
+- 只走 B 站官方 html5 播放接口（见 bili_api.py），音频统一转成
+  16kHz 单声道 WAV；默认整段发送，可在配置里开启按 60 秒切片；
 - 语音使用 AstrBot 的 Record 组件：OneBot/NapCat 与 QQ 官方机器人各自会转 silk；
 - 不依赖 requests，不修改 AstrBot 核心依赖版本。
 """
@@ -20,7 +21,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -28,7 +28,6 @@ import urllib.parse
 import urllib.request
 import wave
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,21 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain, Record
 from astrbot.api.star import Context, Star
+
+try:  # httpx 由 AstrBot 运行环境提供，缺少时插件会提示依赖缺失
+    import httpx
+except ImportError:  # pragma: no cover
+    httpx = None  # type: ignore[assignment]
+
+try:  # 插件正常以包的形式加载
+    from . import bili_api as _bili_api
+except ImportError:  # pragma: no cover - 脚本方式运行时退化为没有官方接口
+    try:
+        import bili_api as _bili_api  # type: ignore[no-redef]
+    except ImportError:
+        _bili_api = None  # type: ignore[assignment]
+
+DIRECT_API_AVAILABLE = _bili_api is not None and httpx is not None
 
 PLUGIN_NAME = "astrbot_plugin_bili_audio"
 USER_AGENT = (
@@ -53,9 +67,20 @@ QR_POLL_INTERVAL = 2.0
 QR_STATE_SUCCESS = 0
 QR_STATE_EXPIRED = 86038
 QR_STATE_SCANNED = 86090
-CREDENTIALS_FILENAME = "credentials.json"
+BUVID_FILENAME = "buvid.json"
 DEFAULT_TIMEOUT = 60
 MAX_ERROR_CHARS = 160
+# 扫码登录接口响应的读取上限；正常响应只有几 KB，固定即可。
+LOGIN_RESPONSE_LIMIT = 1024 * 1024
+# 同一次指令里 probe 与下载共用视频信息，避免重复打接口。
+INFO_CACHE_TTL = 300.0
+# 官方接口下的是 muxed mp4，比纯音频流大，给它一个比解析更宽松的下限。
+MIN_DOWNLOAD_SECONDS = 120.0
+# B 站接口错误码分类。
+RISK_CODES = frozenset({-352, -403, -412, 567})
+REGION_CODES = frozenset({-10403, 87008})
+LOGIN_CODES = frozenset({-101, -111})
+UNAVAILABLE_CODES = frozenset({-404, 62002, 62004, 62012})
 
 _BV_RE = re.compile(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])")
 _URL_LIKE_RE = re.compile(r"(?i)(https?://|www\.|b23\.tv|bilibili\.com)")
@@ -252,7 +277,6 @@ def _as_float(value: object, default: float, low: float, high: float) -> float:
 @dataclass
 class PluginSettings:
     max_audio_mb: int = 100
-    max_parse_mb: int = 16
     audio_chunk_seconds: int = 60
     max_audio_chunks: int = 30
     audio_send_interval: float = 0.6
@@ -260,18 +284,14 @@ class PluginSettings:
     cooldown_seconds: int = 20
     max_concurrent: int = 1
     timeout_seconds: int = DEFAULT_TIMEOUT
+    enable_slicing: bool = False
     cookie: str = ""
     proxy: str = ""
-    ffmpeg_path: str = ""
     cleanup_delay_seconds: float = 600.0
 
     @property
     def max_audio_bytes(self) -> int:
         return self.max_audio_mb * 1024 * 1024
-
-    @property
-    def max_parse_bytes(self) -> int:
-        return self.max_parse_mb * 1024 * 1024
 
     @classmethod
     def from_config(cls, raw: dict | None) -> PluginSettings:
@@ -287,7 +307,6 @@ class PluginSettings:
 
         return cls(
             max_audio_mb=_as_int(get("max_audio_mb", 100), 100, 1, 100),
-            max_parse_mb=_as_int(get("max_parse_mb", 16), 16, 1, 128),
             audio_chunk_seconds=_as_int(
                 get("audio_chunk_seconds", 60), 60, 1, 60
             ),
@@ -301,9 +320,9 @@ class PluginSettings:
             timeout_seconds=_as_int(
                 get("timeout_seconds", DEFAULT_TIMEOUT), DEFAULT_TIMEOUT, 10, 600
             ),
+            enable_slicing=_as_bool(get("enable_slicing", False), False),
             cookie=cookie,
             proxy=str(get("proxy", "") or "").strip(),
-            ffmpeg_path=str(get("ffmpeg_path", "") or "").strip(),
         )
 
 
@@ -325,20 +344,8 @@ def _imageio_ffmpeg_exe() -> str | None:
     return None
 
 
-def resolve_ffmpeg(configured_path: str = "") -> str:
-    """按配置 -> PATH -> imageio-ffmpeg 的顺序找到 ffmpeg。"""
-    configured_path = str(configured_path or "").strip().strip('"').strip("'")
-    if configured_path:
-        candidate = Path(os.path.expanduser(configured_path))
-        if candidate.is_dir():
-            candidate = candidate / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if candidate.is_file():
-            # worker 的 cwd 是临时目录，必须返回绝对路径。
-            return str(candidate.resolve())
-        raise FfmpegMissingError(
-            f"配置的 ffmpeg 路径不存在：{configured_path}"
-        )
-
+def resolve_ffmpeg() -> str:
+    """按 PATH -> imageio-ffmpeg 的顺序找到 ffmpeg。"""
     found = shutil.which("ffmpeg")
     if found:
         return str(Path(found).resolve())
@@ -348,8 +355,8 @@ def resolve_ffmpeg(configured_path: str = "") -> str:
         return bundled
 
     raise FfmpegMissingError(
-        "未找到 ffmpeg，无法提取音频。请安装 ffmpeg，或在插件配置里填写 "
-        "ffmpeg_path；也可以重新安装插件依赖（imageio-ffmpeg 会自带二进制）。"
+        "未找到 ffmpeg，无法提取音频。请安装 ffmpeg，或重新安装插件依赖"
+        "（imageio-ffmpeg 会自带二进制）。"
     )
 
 
@@ -490,82 +497,63 @@ def slice_wav(
 
 
 # --------------------------------------------------------------------------- #
-# yt-dlp 封装
+# 错误码翻译
 # --------------------------------------------------------------------------- #
-class _YdlLogger:
-    def debug(self, message: str) -> None:
-        if message and not message.startswith("[debug]"):
-            logger.debug("yt-dlp: %s", redact(message))
-
-    def warning(self, message: str) -> None:
-        logger.warning("yt-dlp: %s", redact(message))
-
-    def error(self, message: str) -> None:
-        logger.error("yt-dlp: %s", redact(message))
-
-
-def map_download_error(exc: BaseException) -> UserVisibleError:
+def map_api_error(exc: BaseException) -> UserVisibleError:
+    """把官方接口异常翻译成可以直接回给用户的提示。"""
     if isinstance(exc, UserVisibleError):
         return exc
-    text = _short_error(exc)
-    lowered = text.lower()
 
-    if "ffmpeg" in lowered and (
-        "not found" in lowered or "not installed" in lowered or "path" in lowered
-    ):
-        return FfmpegMissingError(
-            "未找到可用的 ffmpeg，无法转码音频。请安装 ffmpeg 或填写 ffmpeg_path。"
-        )
-    if "unsupported url" in lowered:
-        return DownloadFailedError("yt-dlp 不支持这个视频链接。")
-    if "http error 412" in lowered or "risk control" in lowered:
-        return DownloadFailedError(
-            "B 站拒绝了请求（风控/412），请稍后重试，或配置 B 站 Cookie。"
-        )
-    if "max-filesize" in lowered or "larger than" in lowered:
-        return MediaTooLargeError("文件超过大小上限，已停止下载。")
-    if "login" in lowered or "premium" in lowered or "vip" in lowered or "大会员" in text:
-        return DownloadFailedError(
-            "该视频需要登录或大会员权限，请在插件配置里填写 B 站 Cookie（SESSDATA）。"
-        )
-    if "private" in lowered or "隐私" in text:
-        return DownloadFailedError("该视频是私密视频，无法访问。")
-    if "requested format is not available" in lowered or "no audio formats" in lowered:
-        return DownloadFailedError("没有找到可用的音频流。")
-    if (
-        "not available" in lowered
-        or "unavailable" in lowered
-        or "does not exist" in lowered
-        or "不存在" in text
-        or "已删除" in text
-        or "http error 404" in lowered
-    ):
-        return DownloadFailedError("视频不存在、已删除或当前地区不可用。")
-    if "timed out" in lowered or "timeout" in lowered:
-        return DownloadFailedError("下载超时，请稍后重试或换更短的视频。")
-    if "http error 403" in lowered:
-        return DownloadFailedError(
-            "B 站拒绝访问（403），请稍后重试；必要时配置 Cookie 或代理。"
-        )
-    detail = text or "未知错误"
-    return DownloadFailedError(f"下载失败：{detail}")
+    if _bili_api is not None and isinstance(exc, _bili_api.BiliDownloadError):
+        if exc.too_large:
+            return MediaTooLargeError(
+                "视频源文件超过 max_audio_mb 上限，已停止下载；"
+                "可在插件配置里调大该值后重试。"
+            )
+        return DownloadFailedError(f"下载音频失败：{_short_error(exc)}")
+
+    if _bili_api is not None and isinstance(exc, _bili_api.BiliApiError):
+        code = exc.numeric_code
+        if code is None:
+            return DownloadFailedError(f"无法连接 B 站接口：{_short_error(exc)}")
+        if code in LOGIN_CODES:
+            return DownloadFailedError(
+                "该视频需要登录才能访问，请发送 /账号登录 或用插件配置填写 B 站 Cookie。"
+            )
+        if code in REGION_CODES:
+            return DownloadFailedError(
+                "该视频在当前地区不可用（地区限制），请配置国内出口的代理后重试。"
+            )
+        if code in RISK_CODES:
+            return DownloadFailedError(
+                "B 站拒绝了官方接口请求（风控），请稍后重试；长期失败可配置代理。"
+            )
+        if code in UNAVAILABLE_CODES:
+            return DownloadFailedError("视频不存在、已删除或当前不可见。")
+        return DownloadFailedError(f"B 站接口返回错误（code={exc.code}），请稍后重试。")
+
+    return DownloadFailedError(f"下载失败：{_short_error(exc)}")
 
 
-def _find_downloaded(root: Path, extensions: set[str]) -> Path | None:
-    candidates: list[Path] = []
-    for path in root.rglob("*"):
-        try:
-            if not path.is_file():
-                continue
-        except OSError:
-            continue
-        if path.name.endswith((".part", ".ytdl", ".temp")):
-            continue
-        if path.suffix.lower() in extensions:
-            candidates.append(path)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item.stat().st_size)
+def _view_cid(data: dict[str, Any]) -> int | None:
+    """从 view 接口结果里取第一个分P 的 cid。"""
+    try:
+        cid = int(data.get("cid") or 0)
+    except (TypeError, ValueError):
+        cid = 0
+    if cid > 0:
+        return cid
+
+    pages = data.get("pages")
+    if isinstance(pages, list) and pages:
+        first = pages[0]
+        if isinstance(first, dict):
+            try:
+                page_cid = int(first.get("cid") or 0)
+            except (TypeError, ValueError):
+                return None
+            return page_cid or None
+    return None
 
 
 def _read_text_tail(path: Path, limit: int = 8192) -> str:
@@ -577,12 +565,6 @@ def _read_text_tail(path: Path, limit: int = 8192) -> str:
             return handle.read().decode("utf-8", "replace")
     except OSError:
         return ""
-
-
-def _write_private_text(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
-    if os.name != "nt":
-        os.chmod(path, 0o600)
 
 
 async def _kill_process(process: asyncio.subprocess.Process) -> None:
@@ -599,279 +581,215 @@ async def _kill_process(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-def _build_child_env() -> dict[str, str]:
-    """把主进程的模块搜索路径传给 worker。
-
-    AstrBot 会把插件依赖装到 ``data/site-packages`` 并插入当前进程的
-    ``sys.path``；子进程不会自动继承这些运行时修改，必须通过 PYTHONPATH 传下去。
-    """
-    env = os.environ.copy()
-    paths: list[str] = []
-    seen: set[str] = set()
-    candidates = list(sys.path)
-    existing = env.get("PYTHONPATH", "")
-    if existing:
-        candidates.extend(existing.split(os.pathsep))
-    for entry in candidates:
-        if not entry:
-            continue
-        try:
-            resolved = Path(entry).resolve()
-        except OSError:
-            continue
-        if not resolved.is_dir():
-            continue
-        key = os.path.normcase(str(resolved))
-        if key in seen:
-            continue
-        seen.add(key)
-        paths.append(str(resolved))
-    if paths:
-        env["PYTHONPATH"] = os.pathsep.join(paths)
-    return env
-
-
 class BiliService:
-    """在独立子进程中运行 yt-dlp，避免阻塞事件循环。"""
+    """通过 B 站官方接口获取视频信息与音频源文件。"""
 
     def __init__(self, settings: PluginSettings, ffmpeg: str | None = None):
         self.settings = settings
         self.ffmpeg = ffmpeg
-        # 扫码登录得到的 Cookie 优先于配置里的 cookie。
-        self.cookie: str | None = None
-        self.worker_path = Path(__file__).resolve().with_name(
-            "bili_ytdlp_worker.py"
-        )
         self.active_processes: set[asyncio.subprocess.Process] = set()
+        # 设备指纹与视频信息缓存，减少同一进程内对 B 站接口的重复请求。
+        self._buvid: dict[str, str] = {}
+        self._buvid_loaded = False
+        self._state_dir: Path | None = None
+        self._view_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def set_ffmpeg(self, ffmpeg: str) -> None:
         self.ffmpeg = ffmpeg
 
-    def set_cookie(self, cookie: str | None) -> None:
-        self.cookie = str(cookie).strip() if cookie else None
+    def set_settings(self, settings: PluginSettings) -> None:
+        """配置写回后刷新运行时设置（Cookie 等随即生效）。"""
+        self.settings = settings
 
     async def aclose(self) -> None:
-        """插件卸载时终止仍在运行的 worker/ffmpeg 子进程。"""
+        """插件卸载时终止仍在运行的 ffmpeg 子进程。"""
         for process in list(self.active_processes):
             await _kill_process(process)
         self.active_processes.clear()
 
-    def _base_opts(self, outdir: Path) -> dict[str, Any]:
-        opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "no_color": True,
-            "noplaylist": True,
-            "socket_timeout": min(30, self.settings.timeout_seconds),
-            "retries": 3,
-            "fragment_retries": 3,
-            "extractor_retries": 3,
-            "cachedir": False,
-            "overwrites": True,
-            "continuedl": True,
-            "restrictfilenames": True,
-            "windowsfilenames": True,
-            "outtmpl": {"default": str(outdir / "%(id)s.%(ext)s")},
-            "http_headers": {
-                "User-Agent": USER_AGENT,
-                "Referer": BILI_REFERER,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-            "logger": _YdlLogger(),
-            "nocheckcertificate": False,
-            "geo_bypass": True,
-            "ignoreerrors": False,
-            "extract_flat": False,
-            "max_filesize": self.settings.max_audio_bytes,
+    # ---------------------------- 官方接口 ------------------------------ #
+    def set_state_dir(self, path: Path | None) -> None:
+        """设置设备指纹等本地状态的存放目录。"""
+        self._state_dir = path
+
+    @property
+    def direct_enabled(self) -> bool:
+        """官方接口是否可用（缺少 httpx 或 bili_api 时不可用）。"""
+        return DIRECT_API_AVAILABLE
+
+    def _buvid_path(self) -> Path | None:
+        if self._state_dir is None:
+            return None
+        return Path(self._state_dir) / BUVID_FILENAME
+
+    def _base_headers(self) -> dict[str, str]:
+        return {
+            "User-Agent": USER_AGENT,
+            "Referer": BILI_REFERER,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        if self.ffmpeg:
-            opts["ffmpeg_location"] = self.ffmpeg
-        cookie = self.cookie or self.settings.cookie
+
+    def _api_headers(self) -> dict[str, str]:
+        headers = self._base_headers()
+        cookie = _bili_api.merge_cookie(self.settings.cookie or "", self._buvid)
         if cookie:
-            opts["http_headers"]["Cookie"] = cookie
-        if self.settings.proxy:
-            opts["proxy"] = self.settings.proxy
-        return opts
+            headers["Cookie"] = cookie
+        return headers
 
-    async def _extract(
-        self, url: str, opts: dict[str, Any], download: bool
-    ) -> dict[str, Any]:
-        """在独立子进程中运行 yt-dlp，超时可以真正 kill 掉。"""
-        worker = self.worker_path
-        if not worker.is_file():
-            raise MissingDependencyError(
-                "缺少 bili_ytdlp_worker.py，无法启动 yt-dlp 处理进程。"
-            )
-        if not sys.executable:
-            raise MissingDependencyError("当前运行环境没有可用的 Python 解释器。")
+    def _client(self) -> Any:
+        timeout = float(self.settings.timeout_seconds)
+        return _bili_api.build_client(
+            proxy=self.settings.proxy,
+            timeout=httpx.Timeout(
+                connect=min(10.0, timeout),
+                read=min(30.0, max(10.0, timeout / 2)),
+                write=min(30.0, max(10.0, timeout / 2)),
+                pool=5.0,
+            ),
+        )
 
-        workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_ytdlp_"))
-        request_path = workdir / "request.json"
-        result_path = workdir / "result.json"
-        log_path = workdir / "ytdlp.log"
-        process: asyncio.subprocess.Process | None = None
+    async def _ensure_buvid(self, client: Any, *, refresh: bool = False) -> None:
+        """复用本地设备指纹；refresh 时重新申请一个。"""
+        if not refresh:
+            if self._buvid_loaded:
+                return
+            stored = _bili_api.load_buvid(self._buvid_path())
+            if stored:
+                self._buvid = stored
+                self._buvid_loaded = True
+                return
         try:
-            clean_opts = dict(opts)
-            clean_opts.pop("logger", None)
-            clean_opts.pop("progress_hooks", None)
-            payload = {
-                "url": url,
-                "opts": clean_opts,
-                "download": download,
-                "max_result_bytes": self.settings.max_parse_bytes,
-            }
+            values = await _bili_api.fetch_buvid(
+                client, headers=self._base_headers()
+            )
+        except Exception as exc:
+            logger.debug("B 站设备指纹获取失败，继续匿名请求：%s", redact(exc))
+            self._buvid = {}
+            self._buvid_loaded = True
+            return
+        self._buvid = values
+        self._buvid_loaded = True
+        if values:
+            _bili_api.save_buvid(self._buvid_path(), values)
+
+    async def _direct_view(self, bvid: str) -> dict[str, Any]:
+        now = time.monotonic()
+        cached = self._view_cache.get(bvid)
+        if cached and now < cached[0]:
+            return cached[1]
+        async with self._client() as client:
+            await self._ensure_buvid(client)
+            data = await _bili_api.fetch_video(
+                client, bvid, headers=self._api_headers()
+            )
+        self._view_cache[bvid] = (time.monotonic() + INFO_CACHE_TTL, data)
+        while len(self._view_cache) > 32:
+            self._view_cache.pop(next(iter(self._view_cache)))
+        return data
+
+    async def _direct_play_info(self, bvid: str, cid: int) -> Any:
+        last_error: Exception | None = None
+        for attempt in range(2):
             try:
-                request_text = json.dumps(payload, ensure_ascii=False)
-            except (TypeError, ValueError) as exc:
-                raise DownloadFailedError("yt-dlp 参数无法序列化。") from exc
-            _write_private_text(request_path, request_text)
-
-            command = [
-                sys.executable,
-                "-u",
-                str(worker),
-                str(request_path),
-                str(result_path),
-            ]
-            popen_kwargs: dict[str, Any] = {
-                "stdout": subprocess.DEVNULL,
-                "cwd": str(workdir),
-                "env": _build_child_env(),
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = getattr(
-                    subprocess, "CREATE_NO_WINDOW", 0
-                )
-
-            with open(log_path, "wb") as log_file:
-                try:
-                    process = await asyncio.create_subprocess_exec(
-                        *command, stderr=log_file, **popen_kwargs
+                async with self._client() as client:
+                    await self._ensure_buvid(client, refresh=attempt > 0)
+                    return await _bili_api.fetch_play_info(
+                        client, bvid, cid, headers=self._api_headers()
                     )
-                except (OSError, ValueError) as exc:
-                    raise MissingDependencyError(
-                        "无法启动 yt-dlp 子进程，请检查 Python 环境。"
-                    ) from exc
-                self.active_processes.add(process)
-
-                try:
-                    try:
-                        await asyncio.wait_for(
-                            process.wait(), timeout=self.settings.timeout_seconds
-                        )
-                    except asyncio.TimeoutError as exc:
-                        await _kill_process(process)
-                        raise DownloadFailedError(
-                            "处理超时，已终止 yt-dlp 子进程。请换更短的视频或稍后重试。"
-                        ) from exc
-                    except asyncio.CancelledError:
-                        await _kill_process(process)
-                        raise
-                    except Exception:
-                        await _kill_process(process)
-                        raise
-                finally:
-                    self.active_processes.discard(process)
-
-            result: dict[str, Any] | None = None
-            if result_path.is_file():
-                try:
-                    if result_path.stat().st_size > self.settings.max_parse_bytes:
-                        raise DownloadFailedError(
-                            f"yt-dlp 解析结果超过 {self.settings.max_parse_mb}MB 上限。"
-                        )
-                    parsed = json.loads(result_path.read_text(encoding="utf-8"))
-                    if isinstance(parsed, dict):
-                        result = parsed
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    logger.warning("读取 yt-dlp 结果失败：%s", redact(exc))
-
-            if result and not result.get("ok"):
-                error = str(result.get("error") or "").strip()
-                if result.get("error_type") == "ModuleNotFoundError":
-                    raise MissingDependencyError(
-                        "当前子进程缺少 yt-dlp 依赖，请重载插件安装 requirements.txt。"
-                    )
-                if result.get("error_type") == "ResultTooLarge":
-                    raise DownloadFailedError(
-                        f"yt-dlp 解析结果超过 {self.settings.max_parse_mb}MB 上限。"
-                    )
-                raise map_download_error(Exception(error or "yt-dlp 执行失败"))
-
-            if process.returncode != 0:
-                log_tail = _short_error(_read_text_tail(log_path))
-                logger.warning(
-                    "yt-dlp 子进程退出码 %s：%s",
-                    process.returncode,
-                    log_tail or "无日志",
+            except Exception as exc:
+                last_error = exc
+                if attempt > 0 or not self._retryable(exc):
+                    raise
+                logger.info(
+                    "B 站播放接口被拒绝（%s），更换设备指纹后重试。",
+                    redact(str(exc)),
                 )
-                raise DownloadFailedError(
-                    "yt-dlp 子进程异常退出，详情已写入日志。"
+                await asyncio.sleep(1.5)
+        raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _retryable(exc: Exception) -> bool:
+        if _bili_api is None:
+            return False
+        return isinstance(exc, _bili_api.BiliApiError) and exc.retryable
+
+    async def _direct_download(self, urls: list[str], dest: Path) -> None:
+        timeout = float(self.settings.timeout_seconds)
+        deadline = time.monotonic() + max(timeout, MIN_DOWNLOAD_SECONDS)
+        async with self._client() as client:
+            await _bili_api.download_media(
+                client,
+                urls,
+                dest,
+                headers=self._api_headers(),
+                max_bytes=self.settings.max_audio_bytes,
+                deadline=deadline,
+            )
+
+    async def _direct_audio(self, target: BiliTarget, workdir: Path) -> Path:
+        data = await self._direct_view(target.video_id)
+        cid = _view_cid(data)
+        if not cid:
+            raise DownloadFailedError("B 站接口没有返回视频分P信息。")
+        dest = workdir / "source.mp4"
+        last: Exception | None = None
+        for attempt in range(2):
+            try:
+                play = await self._direct_play_info(target.video_id, cid)
+                limit = self.settings.max_audio_bytes
+                if play.total_size and play.total_size > limit:
+                    raise _bili_api.BiliDownloadError(
+                        f"源文件 {play.total_size / 1048576:.1f}MB"
+                        f" 超过 {limit / 1048576:.1f}MB 上限",
+                        too_large=True,
+                    )
+                await self._direct_download(list(play.urls), dest)
+                return dest
+            except _bili_api.BiliDownloadError as exc:
+                last = exc
+                if attempt > 0 or exc.too_large:
+                    raise
+                logger.info(
+                    "B 站 CDN 下载失败（%s），重新获取播放地址后重试。",
+                    redact(str(exc)),
                 )
+        raise last  # type: ignore[misc]
 
-            if not result:
-                raise DownloadFailedError("yt-dlp 没有返回可解析的结果。")
-
-            info = result.get("info")
-            if not isinstance(info, dict):
-                raise DownloadFailedError("解析失败：yt-dlp 返回的数据格式异常。")
-            return info
-
-        finally:
-            if process is not None:
-                self.active_processes.discard(process)
-            shutil.rmtree(workdir, ignore_errors=True)
-
-    async def _unwrap_info(self, info: dict[str, Any]) -> dict[str, Any]:
-        if info.get("_type") not in {"playlist", "multi_video"}:
-            return info
-        entries = [item for item in (info.get("entries") or []) if isinstance(item, dict)]
-        if not entries:
-            raise DownloadFailedError("没有找到可下载的视频。")
-        entry = entries[0]
-        if not entry.get("formats"):
-            entry_url = entry.get("webpage_url") or entry.get("url")
-            if entry_url:
-                opts = self._base_opts(Path(tempfile.gettempdir()))
-                entry = await self._extract(str(entry_url), opts, False)
-        if isinstance(entry, dict) and entry.get("_type") in {"playlist", "multi_video"}:
-            return await self._unwrap_info(entry)
-        return entry
+    @staticmethod
+    def _direct_meta(data: dict[str, Any], target: BiliTarget) -> MediaMeta:
+        owner = data.get("owner")
+        uploader = str(owner.get("name") or "") if isinstance(owner, dict) else ""
+        return MediaMeta(
+            title=_clean_title(data.get("title")),
+            duration=_as_float(data.get("duration"), 0.0, 0.0, 86400.0),
+            uploader=uploader,
+            webpage_url=target.url,
+            info={"source": "bilibili-api"},
+        )
 
     async def probe(self, target: BiliTarget) -> MediaMeta:
-        opts = self._base_opts(Path(tempfile.gettempdir()))
-        info = await self._extract(target.url, opts, False)
-        info = await self._unwrap_info(info)
-        return MediaMeta(
-            title=_clean_title(info.get("title") or info.get("fulltitle")),
-            duration=_as_float(info.get("duration"), 0.0, 0.0, 86400.0),
-            uploader=str(info.get("uploader") or ""),
-            webpage_url=str(info.get("webpage_url") or target.url),
-            info=info,
-        )
+        if not self.direct_enabled:
+            raise MissingDependencyError(
+                "缺少 httpx 或 bili_api.py，无法访问 B 站官方接口。"
+            )
+        try:
+            data = await self._direct_view(target.video_id)
+        except Exception as exc:
+            raise map_api_error(exc) from exc
+        return self._direct_meta(data, target)
 
     async def fetch_audio(self, target: BiliTarget, workdir: Path) -> Path:
-        attempt = workdir / "audio"
-        attempt.mkdir(parents=True, exist_ok=True)
-        opts = self._base_opts(attempt)
-        opts["format"] = (
-            "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
-        )
-        await self._extract(target.url, opts, True)
-        path = _find_downloaded(
-            attempt, {".m4a", ".mp3", ".webm", ".opus", ".aac", ".flac", ".ogg", ".wav"}
-        )
-        if path is None:
-            raise DownloadFailedError("下载完成但没有找到音频文件。")
-        size = path.stat().st_size
-        if size <= 0:
-            raise DownloadFailedError("下载的音频文件为空。")
-        if size > self.settings.max_audio_bytes:
-            raise MediaTooLargeError(
-                f"音频源文件超过 {self.settings.max_audio_mb}MB 上限。"
+        if not self.direct_enabled:
+            raise MissingDependencyError(
+                "缺少 httpx 或 bili_api.py，无法访问 B 站官方接口。"
             )
-        return path
+        attempt = workdir / "api"
+        attempt.mkdir(parents=True, exist_ok=True)
+        try:
+            return await self._direct_audio(target, attempt)
+        except Exception as exc:
+            shutil.rmtree(attempt, ignore_errors=True)
+            raise map_api_error(exc) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -1093,12 +1011,12 @@ class BiliMediaPlugin(Star):
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._cleanup_delay = self.settings.cleanup_delay_seconds
         self.login_client = BiliLoginClient(
-            self.settings.timeout_seconds, self.settings.max_parse_bytes
+            self.settings.timeout_seconds, LOGIN_RESPONSE_LIMIT
         )
         self._login_lock = asyncio.Lock()
         self._data_dir_path: Path | None = None
-        self._stored_credentials: dict[str, Any] | None = None
-        self._credentials_loaded = False
+        # 设备指纹缓存在插件数据目录，重载后仍保持同一身份。
+        self.service.set_state_dir(self._data_dir())
 
     # ---------------------------- 指令入口 ---------------------------- #
     @filter.command("提取音频")
@@ -1123,17 +1041,10 @@ class BiliMediaPlugin(Star):
 
         workdir: Path | None = None
         try:
-            self._ensure_credentials()
-            current = self._stored_credentials or {}
             caption = (
                 "请用哔哩哔哩 App 扫描二维码，并在手机上确认登录。\n"
-                "二维码 3 分钟内有效；确认后机器人会自动保存凭据。"
+                "二维码 3 分钟内有效；确认后机器人会把 Cookie 写入插件配置。"
             )
-            if current:
-                caption += (
-                    f"\n当前已登录：{self._credential_name(current)}，"
-                    "扫码成功后会替换为新的账号。"
-                )
 
             qr = await self.login_client.generate()
             workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_login_"))
@@ -1166,14 +1077,20 @@ class BiliMediaPlugin(Star):
                         nav.get("mid") or ""
                     )
                     nickname = str(nav.get("uname") or "B站账号")
-                    saved = self._save_credentials(cookie, uid, nickname)
-                    self.service.set_cookie(cookie)
+                    saved = self._apply_cookie(cookie)
                     text = f"B 站账号登录成功：{nickname}"
                     if uid:
                         text += f"（UID {uid}）"
-                    text += "\n后续 /提取音频 会自动使用该账号。"
-                    if not saved:
-                        text += "\n警告：登录成功，但凭据写入失败，重启插件后需要重新扫码。"
+                    if saved:
+                        text += (
+                            "\nCookie 已写入插件配置，"
+                            "后续 /提取音频 会自动使用该账号。"
+                        )
+                    else:
+                        text += (
+                            "\nCookie 只在本次运行内有效；写入配置失败，"
+                            "重载插件后需要重新扫码。"
+                        )
                     yield event.plain_result(text)
                     return
 
@@ -1213,47 +1130,47 @@ class BiliMediaPlugin(Star):
     @filter.platform_adapter_type(_SUPPORTED_PLATFORMS)
     async def account_status(self, event: AstrMessageEvent):
         self._block_llm(event)
-        self._ensure_credentials()
-        if self._stored_credentials:
-            updated = self._format_time(self._stored_credentials.get("updated_at"))
+        cookie = str(self.config.get("cookie") or "").strip()
+        if not cookie:
             yield event.plain_result(
-                "当前使用扫码登录的 B 站账号："
-                f"{self._credential_name(self._stored_credentials)}"
-                + (f"\n更新时间：{updated}" if updated else "")
-                + "\n发送 /账号登录 可更换账号，发送 /退出登录 可清除。"
+                "尚未配置 B 站 Cookie。发送 /账号登录 扫码后会自动写入配置。"
             )
             return
-        if self.settings.cookie:
+
+        nav = await self.login_client.fetch_nav(cookie)
+        if not nav:
             yield event.plain_result(
-                "当前使用插件配置里的 B 站 Cookie（不是扫码登录）。\n"
-                "发送 /账号登录 可改用扫码账号。"
+                "插件配置里已有 B 站 Cookie，但校验未通过：可能已失效，"
+                "请发送 /账号登录 重新扫码。"
             )
             return
-        yield event.plain_result(
-            "尚未登录 B 站。发送 /账号登录，用哔哩哔哩 App 扫码即可。"
-        )
+
+        name = str(nav.get("uname") or "B站账号")
+        uid = str(nav.get("mid") or "")
+        text = f"当前使用插件配置里的 B 站账号：{name}"
+        if uid:
+            text += f"（UID {uid}）"
+        text += "\n发送 /账号登录 可更换账号，发送 /退出登录 可清除 Cookie。"
+        yield event.plain_result(text)
 
     @filter.command("退出登录")
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.platform_adapter_type(_SUPPORTED_PLATFORMS)
     async def account_logout(self, event: AstrMessageEvent):
         self._block_llm(event)
-        self._ensure_credentials()
-        had_credentials = self._stored_credentials is not None
-        removed = self._delete_credentials()
-        if not removed:
-            yield event.plain_result("清除扫码凭据失败，请查看日志后重试。")
+        if not str(self.config.get("cookie") or "").strip():
+            yield event.plain_result(
+                "当前没有配置 B 站 Cookie。发送 /账号登录 扫码即可登录。"
+            )
             return
-        self.service.set_cookie(None)
-        if had_credentials:
-            text = "已退出扫码登录的 B 站账号。"
-        else:
-            text = "当前没有扫码登录的 B 站账号。"
-        if self.settings.cookie:
-            text += "\n仍会使用插件配置里的 Cookie 作为兜底。"
-        else:
-            text += "\n如需重新登录，请发送 /账号登录。"
-        yield event.plain_result(text)
+        if not self._apply_cookie(""):
+            yield event.plain_result(
+                "已清空本次运行使用的 Cookie，但写入配置失败，请检查日志。"
+            )
+            return
+        yield event.plain_result(
+            "已清除插件配置里的 B 站 Cookie。发送 /账号登录 可重新扫码。"
+        )
 
     # ---------------------------- 主流程 ------------------------------ #
     async def _handle_media(self, event: AstrMessageEvent, bvid: str):
@@ -1291,7 +1208,6 @@ class BiliMediaPlugin(Star):
             workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_audio_"))
             self._tmp_dirs.add(workdir)
             ffmpeg = await self._ensure_ffmpeg()
-            self._ensure_credentials()
 
             meta = await self.service.probe(target)
             if self.settings.send_progress:
@@ -1306,24 +1222,30 @@ class BiliMediaPlugin(Star):
                 timeout=min(60.0, float(self.settings.timeout_seconds)),
                 processes=self.service.active_processes,
             )
-            chunks = slice_wav(
-                wav_path,
-                self.settings.audio_chunk_seconds,
-                self.settings.max_audio_chunks,
-                workdir / "chunks",
-            )
-            for index, chunk in enumerate(chunks.paths):
-                self._track_file(event, chunk)
+
+            if not self.settings.enable_slicing:
+                self._track_file(event, wav_path)
                 success = True
-                yield event.chain_result([_make_record_component(chunk)])
-                if index + 1 < len(chunks.paths):
-                    await asyncio.sleep(self.settings.audio_send_interval)
-            if chunks.truncated:
-                yield event.plain_result(
-                    f"音频共 {_fmt_duration(chunks.duration)}，超过单次 "
-                    f"{len(chunks.paths)} 段限制，仅发送前 {len(chunks.paths)} 段"
-                    f"（每段 {self.settings.audio_chunk_seconds} 秒）。"
+                yield event.chain_result([_make_record_component(wav_path)])
+            else:
+                chunks = slice_wav(
+                    wav_path,
+                    self.settings.audio_chunk_seconds,
+                    self.settings.max_audio_chunks,
+                    workdir / "chunks",
                 )
+                for index, chunk in enumerate(chunks.paths):
+                    self._track_file(event, chunk)
+                    success = True
+                    yield event.chain_result([_make_record_component(chunk)])
+                    if index + 1 < len(chunks.paths):
+                        await asyncio.sleep(self.settings.audio_send_interval)
+                if chunks.truncated:
+                    yield event.plain_result(
+                        f"音频共 {_fmt_duration(chunks.duration)}，超过单次 "
+                        f"{len(chunks.paths)} 段限制，仅发送前 {len(chunks.paths)} 段"
+                        f"（每段 {self.settings.audio_chunk_seconds} 秒）。"
+                    )
 
         except UserVisibleError as exc:
             logger.warning("B站音频处理失败：%s", redact(str(exc)))
@@ -1343,14 +1265,27 @@ class BiliMediaPlugin(Star):
                     self._rmtree(workdir)
 
     # ---------------------------- 辅助 -------------------------------- #
-    def _ensure_credentials(self) -> None:
-        if self._credentials_loaded:
-            return
-        self._credentials_loaded = True
-        data = self._load_credentials()
-        self._stored_credentials = data
-        if data and data.get("cookie"):
-            self.service.set_cookie(str(data["cookie"]))
+    def _apply_cookie(self, cookie: str) -> bool:
+        """把 Cookie 写回插件配置并刷新运行时设置，返回是否持久化成功。"""
+        value = str(cookie or "").strip()
+        try:
+            self.config["cookie"] = value
+        except Exception:
+            logger.error("更新 B 站 Cookie 配置失败", exc_info=True)
+        self.settings = PluginSettings.from_config(self.config)
+        self.service.set_settings(self.settings)
+
+        saver = getattr(self.config, "save_config", None)
+        if not callable(saver):
+            logger.warning("当前环境不支持写回插件配置，Cookie 仅在本次运行有效。")
+            return False
+        try:
+            saver()
+            return True
+        except Exception:
+            logger.error("保存插件配置失败", exc_info=True)
+            return False
+
 
     def _data_dir(self, create: bool = False) -> Path:
         if self._data_dir_path is None:
@@ -1369,76 +1304,10 @@ class BiliMediaPlugin(Star):
             self._data_dir_path.mkdir(parents=True, exist_ok=True)
         return self._data_dir_path
 
-    def _credentials_path(self, create: bool = False) -> Path:
-        return self._data_dir(create=create) / CREDENTIALS_FILENAME
 
-    def _load_credentials(self) -> dict[str, Any] | None:
-        path = self._credentials_path(create=False)
-        if not path.is_file():
-            return None
-        try:
-            if path.stat().st_size > self.settings.max_parse_bytes:
-                logger.warning(
-                    "B 站扫码凭据文件超过解析上限 %sMB，已忽略。",
-                    self.settings.max_parse_mb,
-                )
-                return None
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            logger.warning("读取 B 站扫码凭据失败：%s", redact(exc))
-            return None
-        if not isinstance(data, dict):
-            logger.warning("B 站扫码凭据格式错误，已忽略。")
-            return None
-        cookie = str(data.get("cookie") or "").strip()
-        if not cookie or "SESSDATA=" not in cookie or "\n" in cookie or "\r" in cookie:
-            logger.warning("B 站扫码凭据缺少有效的 SESSDATA，已忽略。")
-            return None
-        data["cookie"] = cookie
-        return data
 
-    def _save_credentials(self, cookie: str, uid: str, nickname: str) -> bool:
-        path = self._credentials_path(create=True)
-        payload = {
-            "cookie": cookie,
-            "uid": str(uid or ""),
-            "nickname": str(nickname or ""),
-            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "source": "qrcode",
-        }
-        self._stored_credentials = payload
-        self._credentials_loaded = True
-        try:
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
-            temporary = path.with_name(path.name + ".tmp")
-            temporary.write_text(text, encoding="utf-8")
-            if os.name != "nt":
-                os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            return True
-        except OSError as exc:
-            logger.error("保存 B 站扫码凭据失败：%s", redact(exc))
-            return False
 
-    def _delete_credentials(self) -> bool:
-        path = self._credentials_path(create=False)
-        try:
-            if path.is_file():
-                path.unlink()
-        except OSError as exc:
-            logger.error("删除 B 站扫码凭据失败：%s", redact(exc))
-            return False
-        self._stored_credentials = None
-        self._credentials_loaded = True
-        return True
 
-    @staticmethod
-    def _credential_name(data: dict[str, Any]) -> str:
-        nickname = str(data.get("nickname") or "").strip()
-        uid = str(data.get("uid") or "").strip()
-        if nickname and uid:
-            return f"{nickname}（UID {uid}）"
-        return nickname or (f"UID {uid}" if uid else "B站账号")
 
     @staticmethod
     def _cookie_value(cookie: str, name: str) -> str:
@@ -1448,22 +1317,11 @@ class BiliMediaPlugin(Star):
                 return value.strip()
         return ""
 
-    @staticmethod
-    def _format_time(value: object) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        try:
-            return datetime.fromisoformat(text).strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            return text
 
     async def _ensure_ffmpeg(self) -> str:
         if self._ffmpeg is None:
             # imageio-ffmpeg 首次解析/解压二进制可能阻塞，不能放在事件循环里。
-            self._ffmpeg = await asyncio.to_thread(
-                resolve_ffmpeg, self.settings.ffmpeg_path
-            )
+            self._ffmpeg = await asyncio.to_thread(resolve_ffmpeg)
             self.service.set_ffmpeg(self._ffmpeg)
         return self._ffmpeg
 
@@ -1518,7 +1376,7 @@ class BiliMediaPlugin(Star):
         title = _clean_title(meta.title)
         duration = f"（{_fmt_duration(meta.duration)}）" if meta.duration > 0 else ""
         estimate = ""
-        if meta.duration > 0:
+        if self.settings.enable_slicing and meta.duration > 0:
             count = min(
                 math.ceil(meta.duration / self.settings.audio_chunk_seconds),
                 self.settings.max_audio_chunks,
